@@ -1,0 +1,285 @@
+import os
+import sys
+import copy
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
+from torchvision.transforms import v2
+from torchvision.datasets import CIFAR10
+from torch.utils.data import DataLoader, Dataset
+import timm
+from tqdm import tqdm
+
+
+class CachedDataset(Dataset):
+    def __init__(self, dataset: Dataset):
+        self.dataset = tuple([x for x in dataset])
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        return self.dataset[i]
+
+
+class ClassificationModel(nn.Module):
+    def __init__(self, backbone_name: str = 'resnet34', num_classes: int = 10):
+        super().__init__()
+        self.backbone_name = backbone_name
+        self.backbone = timm.create_model(backbone_name, pretrained=False)
+
+        if hasattr(self.backbone, 'conv1'):
+            in_c = self.backbone.conv1.in_channels
+            out_c = self.backbone.conv1.out_channels
+            self.backbone.conv1 = nn.Conv2d(in_c, out_c, kernel_size=3, stride=1, padding=1, bias=False)
+        if hasattr(self.backbone, 'maxpool'):
+            self.backbone.maxpool = nn.Identity()
+
+        self.backbone.fc = nn.Linear(self.backbone.fc.weight.size(1), num_classes)
+
+    def forward(self, x):
+        return self.backbone(x)
+
+
+def tta_infer(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    def infer_mirror(inp: torch.Tensor) -> torch.Tensor:
+        return 0.5 * model(inp) + 0.5 * model(inp.flip(-1).contiguous())
+
+    logits = infer_mirror(x)
+    padded = F.pad(x, (1, 1, 1, 1), mode='reflect')
+    trans1 = padded[:, :, 0:32, 0:32].contiguous()
+    trans2 = padded[:, :, 2:34, 2:34].contiguous()
+    logits_trans = 0.5 * (infer_mirror(trans1) + infer_mirror(trans2))
+    return 0.5 * logits + 0.5 * logits_trans
+
+
+def get_dataset(data_path: str, is_train: bool):
+    initial_transforms = [
+        v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),
+    ]
+    if is_train:
+        initial_transforms.append(v2.Pad(padding=4, fill=0.5))
+    else:
+        initial_transforms.append(
+            v2.Normalize(mean=(0.491, 0.482, 0.446), std=(0.247, 0.243, 0.261), inplace=True)
+        )
+
+    cifar10 = CIFAR10(root=data_path, train=is_train, transform=v2.Compose(initial_transforms), download=True)
+    return CachedDataset(cifar10)
+
+
+def get_cutmix_or_mixup(num_classes: int = 10):
+    return v2.RandomChoice([
+        v2.CutMix(num_classes=num_classes),
+        v2.MixUp(num_classes=num_classes),
+        v2.Identity(),
+    ])
+
+
+class EfficientTrainer:
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: Optimizer,
+        criterion: nn.Module,
+        batch_size: int = 128,
+        val_batch_size: int = 500,
+        epochs: int = 100,
+        save_path: str = "best_efficient_pipeline_5.pth",
+        data_path: str = "./data",
+        ema_decay: float = 0.999
+    ):
+        self.device = torch.accelerator.current_accelerator()
+        print(f"Using device {self.device}")
+
+        self.scaler = torch.amp.GradScaler('cuda', enabled=(self.device.type == "cuda"))
+
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision('high')
+
+        ema_model = copy.deepcopy(model).to(self.device).eval()
+        ema_model.requires_grad_(False)
+
+        if sys.version_info < (3, 14):
+            self.model = torch.jit.script(model).to(self.device)
+            self.ema_model = torch.jit.script(ema_model)
+        else:
+            self.model = model.to(self.device)
+            self.ema_model = ema_model
+
+        self.ema_decay = ema_decay
+
+        self.optimizer = optimizer
+        self.criterion = criterion.to(self.device)
+        self.epochs = epochs
+        self.save_path = save_path
+
+        def lr_lambda(epoch):
+            warmup_epochs = 5
+            if epoch < warmup_epochs:
+                return float(epoch + 1) / float(warmup_epochs)
+            progress = float(epoch - warmup_epochs) / float(max(1, epochs - warmup_epochs))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
+
+        train_dataset = get_dataset(data_path, is_train=True)
+        val_dataset = get_dataset(data_path, is_train=False)
+
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=True
+        )
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            pin_memory=True
+        )
+
+        self.batch_transforms = v2.Compose([
+            v2.RandomCrop(size=32),
+            v2.RandomHorizontalFlip(),
+            v2.RandomErasing(scale=(0.01, 0.15), value=0.5, inplace=True),
+            v2.Normalize(mean=(0.491, 0.482, 0.446), std=(0.247, 0.243, 0.261), inplace=True),
+        ])
+
+        self.cutmix_mixup = get_cutmix_or_mixup(10)
+        self.best_val_acc = 0.0
+        self.batch_size = batch_size
+
+    @torch.no_grad()
+    def update_ema(self):
+        d = self.ema_decay
+        for ema_p, p in zip(self.ema_model.parameters(), self.model.parameters()):
+            ema_p.data.mul_(d).add_(p.data, alpha=1.0 - d)
+        for ema_b, b in zip(self.ema_model.buffers(), self.model.buffers()):
+            ema_b.copy_(b)
+
+    def step(self, data: torch.Tensor, target: torch.Tensor):
+        with torch.amp.autocast(device_type=self.device.type, dtype=torch.float16, enabled=(self.device.type == "cuda")):
+            predicted = self.model(data)
+            loss = self.criterion(predicted, target)
+
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad()
+
+        self.update_ema()
+
+        return predicted, loss
+
+    def train_epoch(self):
+        self.model.train()
+        total = 0
+        correct = 0
+        total_loss = 0.0
+
+        for data, target in tqdm(self.train_loader, desc="Training", leave=False):
+            data = data.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
+
+            data = self.batch_transforms(data)
+            data, target = self.cutmix_mixup(data, target)
+
+            predicted, loss = self.step(data, target)
+
+            if target.ndim > 1:
+                target = target.argmax(1)
+
+            correct += predicted.argmax(1).eq(target).sum().item()
+            total += data.size(0)
+            total_loss += float(loss.item())
+
+        return correct / total, total_loss / len(self.train_loader)
+
+    @torch.inference_mode()
+    def validate(self, use_ema: bool = True, use_tta: bool = False):
+        eval_model = self.ema_model if use_ema else self.model
+        eval_model.eval()
+        total = 0
+        correct = 0
+        total_loss = 0.0
+
+        for data, target in tqdm(self.val_loader, desc="Validation", leave=False):
+            data = data.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
+            with torch.amp.autocast(device_type=self.device.type, dtype=torch.float16, enabled=(self.device.type == "cuda")):
+                if use_tta:
+                    predicted = tta_infer(eval_model, data)
+                else:
+                    predicted = eval_model(data)
+                loss = self.criterion(predicted, target)
+
+            correct += predicted.argmax(1).eq(target).sum().item()
+            total += data.size(0)
+            total_loss += float(loss.item())
+
+        return correct / total, total_loss / len(self.val_loader)
+
+    def run(self, epochs: int | None = None):
+        if epochs is None:
+            epochs = self.epochs
+
+        with tqdm(range(epochs), desc="Training", ncols=140) as pbar:
+            for epoch in pbar:
+                tr_acc, tr_loss = self.train_epoch()
+                va_acc, va_loss = self.validate(use_ema=True, use_tta=False)
+                self.scheduler.step()
+
+                tta_acc = va_acc
+                if va_acc >= self.best_val_acc or epoch >= epochs - 5 or (epoch + 1) % 10 == 0:
+                    tta_acc, _ = self.validate(use_ema=True, use_tta=True)
+
+                eval_acc = max(va_acc, tta_acc)
+                if eval_acc > self.best_val_acc:
+                    self.best_val_acc = eval_acc
+                    torch.save({
+                        'model_state_dict': self.ema_model.state_dict(),
+                        'model_name': getattr(self.model, 'backbone_name', 'resnet34'),
+                        'best_val_acc': self.best_val_acc,
+                    }, self.save_path)
+
+                pbar.set_postfix(train_acc=tr_acc, train_loss=round(tr_loss, 3), val_acc=va_acc,
+                                 tta_acc=tta_acc, best_val_acc=self.best_val_acc)
+
+
+def main():
+    model = ClassificationModel(backbone_name='resnet34', num_classes=10)
+
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.1,
+        momentum=0.9,
+        nesterov=True,
+        weight_decay=5e-4,
+        fused=True
+    )
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    trainer = EfficientTrainer(
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        batch_size=128,
+        val_batch_size=500,
+        epochs=100,
+        save_path="best_efficient_pipeline_5.pth",
+        data_path="./data",
+        ema_decay=0.999
+    )
+    trainer.run()
+
+
+if __name__ == "__main__":
+    main()
